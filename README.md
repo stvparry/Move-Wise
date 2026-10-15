@@ -1,4 +1,4 @@
-# MoveWise UK v3
+# MoveWise UK v4
 Upload the four files in this folder to the root of a GitHub repository and deploy `streamlit_app.py` in Streamlit Community Cloud. No API keys are required.
 
-V3 shows an executive summary directly below the action button, keeps results in Streamlit session state, explains gains and trade-offs in plain English, hides detailed evidence in an expander, and provides downloadable HTML or CSV output.
+Key change: unavailable evidence is excluded rather than scored as zero. V4 provides a visible consultant-style verdict, personal context, gains, cautions, evidence status, map, downloadable HTML report and research links to Area360, HM Land Registry and data.gov.uk.
