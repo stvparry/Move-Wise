@@ -1,74 +1,112 @@
-import html,urllib.parse,pandas as pd,plotly.graph_objects as go,streamlit as st,folium
+import re,time,html,requests,pandas as pd,plotly.graph_objects as go,streamlit as st,folium
 from streamlit_folium import st_folium
-from services import candidates,profile,route,food_hygiene,flood_context
-st.set_page_config(page_title='MoveWise UK v5',page_icon='🏡',layout='wide')
-st.markdown('''<style>.stApp{background:#f6faf8}.hero{background:linear-gradient(120deg,#123f52,#0f766e);color:white;padding:26px 30px;border-radius:22px}.card{background:white;padding:20px;border-radius:16px;border:1px solid #dce9e4;margin:10px 0}.verdict{font-size:1.7rem;font-weight:800;color:#0f766e}.stButton button,.stDownloadButton button{background:#0f766e;color:white;border:none}[data-testid=stMetric]{background:white;border:1px solid #dce9e4;padding:10px;border-radius:14px}</style>''',unsafe_allow_html=True)
-st.markdown('<div class=hero><h1>🏡 MoveWise UK v5</h1><p>A more personal location-selection consultant, using live evidence where available.</p></div>',unsafe_allow_html=True)
-THEMES=['Travel','Parks','Shops','Schools','Leisure','Healthcare','Social life','Lower recorded crime']
-if 'brief5' not in st.session_state:st.session_state.brief5=None
-with st.sidebar:
- st.header('Location priorities');weights={k:st.slider(k,0,10,7 if k in ['Travel','Parks','Healthcare'] else 5,key=k) for k in THEMES};radius=st.select_slider('Local radius',[1000,2000,3000,5000],3000,format_func=lambda x:f'{x/1000:g} km')
-def pick(title,key,default):
- st.subheader(title);q=st.text_input('Address, postcode, village, town, city or county',default,key=key+'q',label_visibility='collapsed');rows=candidates(q) if q else []
- if not rows:st.warning('No UK match found. Add a county or postcode.');return None
- i=st.selectbox('Confirm intended location',range(len(rows)),format_func=lambda n:rows[n]['label'],key=key+'s');return rows[i]
+st.set_page_config(page_title='MoveWise UK v5.1',page_icon='🏡',layout='wide')
+UA={'User-Agent':'MoveWise-UK-v5.1 educational demo'}; THEMES=['Travel','Parks','Shops','Schools','Leisure','Healthcare','Social life','Lower recorded crime']
+SERVERS=['https://overpass.kumi.systems/api/interpreter','https://overpass-api.de/api/interpreter','https://overpass.nchc.org.tw/api/interpreter']
+TAGS={'Shops':'[shop]','Schools':'[amenity=school]','Parks':'[leisure=park]','Leisure':'[leisure~"fitness_centre|sports_centre|swimming_pool|golf_course"]','Healthcare':'[amenity~"hospital|clinic|doctors|pharmacy"]','Social life':'[amenity~"restaurant|cafe|pub"]','Rail':'[railway=station]','Bus':'[highway=bus_stop]'}
+def get(url,params=None,timeout=25,headers=None):
+ r=requests.get(url,params=params,headers=headers or UA,timeout=timeout);r.raise_for_status();return r.json()
+@st.cache_data(ttl=86400,show_spinner=False)
+def candidates(text,limit=6):
+ out=[];text=text.strip();pc=re.search(r'\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b',text.upper())
+ if pc:
+  try:
+   x=get('https://api.postcodes.io/postcodes/'+pc.group(1).replace(' ',''))['result'];out.append({'label':f"{x['postcode']} · {x.get('admin_district','')}",'lat':x['latitude'],'lon':x['longitude'],'kind':'postcode'})
+  except Exception:pass
+ try:
+  q=text if 'united kingdom' in text.lower() else text+', United Kingdom'
+  for x in get('https://nominatim.openstreetmap.org/search',{'q':q,'format':'jsonv2','addressdetails':1,'limit':limit,'countrycodes':'gb'}):
+   z={'label':x['display_name'],'lat':float(x['lat']),'lon':float(x['lon']),'kind':x.get('type','place')}
+   if not any(abs(z['lat']-v['lat'])<.0001 and abs(z['lon']-v['lon'])<.0001 for v in out):out.append(z)
+ except Exception:pass
+ return out[:limit]
+@st.cache_data(ttl=21600,show_spinner=False)
+def amenities(lat,lon,radius):
+ parts=[f'{typ}{tag}(around:{radius},{lat},{lon});' for tag in TAGS.values() for typ in ['node','way','relation']];query='[out:json][timeout:25];('+''.join(parts)+');out center tags;'
+ for endpoint in SERVERS:
+  try:
+   rows=get(endpoint,{'data':query},45).get('elements',[]);out={k:[] for k in TAGS}
+   for e in rows:
+    t=e.get('tags',{});m=[]
+    if 'shop' in t:m+=['Shops']
+    if t.get('amenity')=='school':m+=['Schools']
+    if t.get('leisure')=='park':m+=['Parks']
+    if t.get('leisure') in ['fitness_centre','sports_centre','swimming_pool','golf_course']:m+=['Leisure']
+    if t.get('amenity') in ['hospital','clinic','doctors','pharmacy']:m+=['Healthcare']
+    if t.get('amenity') in ['restaurant','cafe','pub']:m+=['Social life']
+    if t.get('railway')=='station':m+=['Rail']
+    if t.get('highway')=='bus_stop':m+=['Bus']
+    for k in m:out[k].append(t.get('name','Unnamed'))
+   if rows:return out,{'ok':True,'source':'OpenStreetMap/Overpass','detail':f'{len(rows)} map objects returned'}
+  except Exception:time.sleep(.3)
+ return {k:[] for k in TAGS},{'ok':False,'source':'OpenStreetMap/Overpass','detail':'No usable response from public endpoints'}
+@st.cache_data(ttl=3600,show_spinner=False)
+def police(lat,lon):
+ try:
+  x=get('https://data.police.uk/api/crimes-street/all-crime',{'lat':lat,'lng':lon},30);return x,{'ok':True,'source':'Police.uk','detail':f'{len(x)} records returned'}
+ except Exception:return [],{'ok':False,'source':'Police.uk','detail':'Unavailable'}
+@st.cache_data(ttl=3600,show_spinner=False)
+def food(lat,lon,radius):
+ try:
+  h={**UA,'x-api-version':'2','Accept-Language':'en-GB'};x=get('https://api.ratings.food.gov.uk/Establishments',{'latitude':lat,'longitude':lon,'maxDistanceLimit':min(10,radius/1000),'pageSize':500},35,h).get('establishments',[]);vals=[]
+  for z in x:
+   try:vals.append(int(z.get('RatingValue')))
+   except Exception:pass
+  return {'count':len(x),'high':sum(v>=4 for v in vals)},{'ok':True,'source':'Food Standards Agency','detail':f'{len(x)} establishments returned'}
+ except Exception:return None,{'ok':False,'source':'Food Standards Agency','detail':'Unavailable'}
+@st.cache_data(ttl=900,show_spinner=False)
+def flood(lat,lon):
+ try:
+  x=get('https://environment.data.gov.uk/flood-monitoring/id/floods',{'lat':lat,'long':lon,'dist':10},30).get('items',[]);return {'count':len(x)},{'ok':True,'source':'Environment Agency','detail':f'{len(x)} active warnings/alerts returned'}
+ except Exception:return None,{'ok':False,'source':'Environment Agency','detail':'Unavailable'}
+@st.cache_data(ttl=86400,show_spinner=False)
+def routing(a_lat,a_lon,b_lat,b_lon):
+ try:
+  x=get(f'https://router.project-osrm.org/route/v1/driving/{a_lon},{a_lat};{b_lon},{b_lat}',{'overview':'false'},30)['routes'][0];return (x['distance']/1609.344,x['duration']/60),{'ok':True,'source':'OSRM','detail':'Approximate route without live traffic'}
+ except Exception:return None,{'ok':False,'source':'OSRM','detail':'Unavailable'}
+def build(loc,radius):
+ am,ast=amenities(loc['lat'],loc['lon'],radius);cr,cst=police(loc['lat'],loc['lon']);scores={};avail=[]
+ if ast['ok']:
+  caps={'Shops':80,'Schools':15,'Parks':10,'Leisure':15,'Healthcare':20,'Social life':70};scores.update({k:min(100,len(am[k])*100/caps[k]) for k in caps});scores['Travel']=min(100,len(am['Rail'])*35+len(am['Bus'])*2);avail+=list(caps)+['Travel']
+ if cst['ok']:scores['Lower recorded crime']=max(0,100-len(cr)/8);avail+=['Lower recorded crime']
+ return {'scores':scores,'available':avail,'status':[ast,cst]}
 def weighted(p,w):
- keys=[k for k in THEMES if k in p['available'] and w[k]>0];return None if not keys else sum(p['scores'][k]*w[k] for k in keys)/sum(w[k] for k in keys)
-def status(s):return ('✅' if s['ok'] else '⚠️')+f" **{s['source']}**: {s['detail']}"
-def profile_text(u):
- bits=[f"Age/life stage: {u['age']}",f"Household: {u['household']}",f"Work: {u['work']}",f"Home-working: {u['homework']}",f"Cars: {u['cars']}",f"Mobility/access: {u['mobility']}",f"Children/schools: {u['children']}",f"Property: {u['property']}",f"Budget: £{u['budget']:,.0f}"]
- return '. '.join(bits)+'.'
-def fit_notes(u):
- out=[]
- if u['work'] not in ['Retired','Not working'] or u['homework']!='Never':out.append('Work pattern makes broadband quality and a tested peak-time commute material.')
- if u['age'] in ['65–74','75+'] or u['mobility']!='No particular requirement':out.append('Healthcare proximity, walkability, gradients and step-free transport deserve extra on-the-ground checks.')
- if u['children']!='No school requirement':out.append('School counts are not enough: check phase, Ofsted report, admissions, catchment and available places.')
- if u['cars']=='No car':out.append('Prioritise all-day public transport, grocery access and healthcare journeys rather than road distance.')
- if u['property'] in ['Flat','Bungalow']:out.append('Confirm local stock, service charges or scarcity before relying on the area-level verdict.')
- return out or ['No dominant household constraint was selected; the briefing follows the priority sliders and free-text preferences.']
-def make_report(r):
- a,b,pa,pb,w,u=r['a'],r['b'],r['pa'],r['pb'],r['weights'],r['user'];common=[k for k in THEMES if k in pa['available'] and k in pb['available']];va,vb=weighted(pa,w),weighted(pb,w);rows=''.join(f'<tr><td>{k}</td><td>{pa["scores"][k]:.0f}</td><td>{pb["scores"][k]:.0f}</td><td>{pb["scores"][k]-pa["scores"][k]:+.0f}</td></tr>' for k in common);sources=pa['status']+pb['status']+[r['route_status'],r['fa_status'],r['fb_status'],r['flooda_status'],r['floodb_status']];summary='Insufficient comparable live evidence' if va is None or vb is None else f'Current {va:.0f}/100; destination {vb:.0f}/100; difference {vb-va:+.0f}'
- return f'''<!doctype html><meta charset=utf-8><style>body{{font-family:Arial;max-width:950px;margin:40px auto;line-height:1.5;color:#17332d}}h1,h2{{color:#0f766e}}table{{border-collapse:collapse;width:100%}}td,th{{padding:9px;border-bottom:1px solid #ddd;text-align:left}}.note{{background:#fff4d6;padding:14px}}</style><h1>MoveWise UK v5 briefing</h1><h2>{html.escape(a['label'])} → {html.escape(b['label'])}</h2><p><b>{summary}</b></p><h2>Household profile</h2><p>{html.escape(profile_text(u))}</p><ul>{''.join('<li>'+html.escape(x)+'</li>' for x in fit_notes(u))}</ul><h2>Evidence scorecard</h2><table><tr><th>Theme</th><th>Current</th><th>Destination</th><th>Difference</th></tr>{rows}</table><h2>Source health</h2><ul>{''.join('<li>'+html.escape(s['source']+': '+s['detail'])+'</li>' for s in sources)}</ul><p class=note>Missing data is excluded, not scored as zero. Food-hygiene counts indicate establishments returned, not overall restaurant quality. Environment Agency information is real-time monitoring context, not a property flood-risk search.</p>'''
-a1,a2=st.columns(2)
-with a1:a=pick('Current location','a','Marlow, Buckinghamshire')
-with a2:b=pick('Possible destination','b','Rickmansworth, Hertfordshire')
-with st.expander('1. Tell MoveWise about the household',expanded=True):
- c1,c2,c3=st.columns(3);age=c1.selectbox('Age or life stage',['Under 25','25–39','40–54','55–64','65–74','75+','Mixed adult ages']);household=c2.selectbox('Household unit',['One person','Couple','Family with young children','Family with teenagers','Multi-generational','Shared household','Other']);work=c3.selectbox('Work status',['Office/site-based','Hybrid','Home-based','Self-employed','Retired','Not working','Mixed household'])
- c1,c2,c3=st.columns(3);homework=c1.selectbox('Home working',['Never','Occasionally','2–3 days a week','Most/all days','Mixed household']);cars=c2.selectbox('Car access',['No car','One car','Two or more cars']);mobility=c3.selectbox('Mobility/accessibility',['No particular requirement','Prefer level walking','Step-free transport important','Mobility aid/wheelchair access important'])
- c1,c2,c3=st.columns(3);children=c1.selectbox('School requirement',['No school requirement','Nursery/early years','Primary','Secondary','Sixth form/college','Several phases']);property_type=c2.selectbox('Preferred property',['No preference','Flat','Terraced','Semi-detached','Detached','Bungalow','Rural/smallholding']);budget=c3.number_input('Approximate budget (£)',0,10000000,750000,25000)
- commute=st.text_input('Regular work, family or care destination',placeholder='e.g. Paddington twice weekly, Heathrow monthly, family in Oxford');must=st.text_area('Must-haves',placeholder='Walkable centre, river walks, GP, station, tennis, cafés…');avoid=st.text_area('Deal-breakers',placeholder='Aircraft noise, steep hills, flood concern, isolation, nightlife…')
-optional=st.expander('2. Optional property-data enhancement',expanded=False)
-with optional:
- st.info('V5 uses free live sources without keys. A future connector can use a paid Homedata API key for property-level sold prices, EPC, broadband, schools, planning and flood risk. Do not paste a valuable key into a public app unless it is stored as a Streamlit secret.');st.text_input('Optional Homedata API key (not used in this release)',type='password',disabled=True)
-if st.button('Create personalised location briefing',type='primary',use_container_width=True) and a and b:
- user={'age':age,'household':household,'work':work,'homework':homework,'cars':cars,'mobility':mobility,'children':children,'property':property_type,'budget':budget,'commute':commute,'must':must,'avoid':avoid}
- with st.spinner('Consulting live map, crime, food hygiene, flood-monitoring and routing sources…'):
-  pa,pb=profile(a,radius),profile(b,radius);rt,rts=route(a,b);fa,fas=food_hygiene(a['lat'],a['lon'],radius/1000);fb,fbs=food_hygiene(b['lat'],b['lon'],radius/1000);fla,flas=flood_context(a['lat'],a['lon']);flb,flbs=flood_context(b['lat'],b['lon']);st.session_state.brief5={'a':a,'b':b,'pa':pa,'pb':pb,'route':rt,'route_status':rts,'fa':fa,'fb':fb,'fa_status':fas,'fb_status':fbs,'flooda':fla,'floodb':flb,'flooda_status':flas,'floodb_status':flbs,'weights':weights.copy(),'user':user}
-r=st.session_state.brief5
+ k=[x for x in THEMES if x in p['available'] and w[x]>0];return None if not k else sum(p['scores'][x]*w[x] for x in k)/sum(w[x] for x in k)
+def picker(title,key,default):
+ st.subheader(title);q=st.text_input('Address, postcode, village, town, city or county',default,key=key+'q',label_visibility='collapsed');rows=candidates(q) if q else []
+ if not rows:st.warning('No location match found.');return None
+ i=st.selectbox('Confirm intended location',range(len(rows)),format_func=lambda n:rows[n]['label'],key=key+'s');return rows[i]
+st.markdown('''<style>.hero{background:linear-gradient(120deg,#123f52,#0f766e);color:white;padding:25px;border-radius:20px}.card{background:white;padding:20px;border-radius:15px;border:1px solid #dce9e4}.stButton button,.stDownloadButton button{background:#0f766e;color:white}</style>''',unsafe_allow_html=True)
+st.markdown('<div class=hero><h1>🏡 MoveWise UK v5.1</h1><p>Personal location-selection consultant with live-source checks.</p></div>',unsafe_allow_html=True)
+if 'result51' not in st.session_state:st.session_state.result51=None
+with st.sidebar:
+ st.header('Priorities');weights={k:st.slider(k,0,10,7 if k in ['Travel','Parks','Healthcare'] else 5,key=k) for k in THEMES};radius=st.select_slider('Local radius',[1000,2000,3000,5000],3000,format_func=lambda x:f'{x/1000:g} km')
+c1,c2=st.columns(2)
+with c1:a=picker('Current location','a','Marlow, Buckinghamshire')
+with c2:b=picker('Possible destination','b','Rickmansworth, Hertfordshire')
+with st.expander('Tell MoveWise about the household',expanded=True):
+ c1,c2,c3=st.columns(3);age=c1.selectbox('Age/life stage',['Under 25','25–39','40–54','55–64','65–74','75+','Mixed ages']);house=c2.selectbox('Household',['One person','Couple','Family with young children','Family with teenagers','Multi-generational','Other']);work=c3.selectbox('Work status',['Office/site-based','Hybrid','Home-based','Self-employed','Retired','Not working','Mixed household'])
+ c1,c2,c3=st.columns(3);cars=c1.selectbox('Car access',['No car','One car','Two or more cars']);mobility=c2.selectbox('Accessibility',['No particular requirement','Prefer level walking','Step-free transport important','Mobility aid/wheelchair important']);schools=c3.selectbox('School requirement',['None','Nursery','Primary','Secondary','Sixth form/college','Several phases'])
+ c1,c2=st.columns(2);prop=c1.selectbox('Preferred property',['No preference','Flat','Terraced','Semi-detached','Detached','Bungalow','Rural/smallholding']);budget=c2.number_input('Budget (£)',0,10000000,750000,25000);commute=st.text_input('Regular work/family/care destination');must=st.text_area('Must-haves');avoid=st.text_area('Deal-breakers')
+if st.button('Create personalised briefing',type='primary',use_container_width=True) and a and b:
+ with st.spinner('Checking live sources…'):
+  pa,pb=build(a,radius),build(b,radius);fa,fas=food(a['lat'],a['lon'],radius);fb,fbs=food(b['lat'],b['lon'],radius);fla,flas=flood(a['lat'],a['lon']);flb,flbs=flood(b['lat'],b['lon']);rt,rts=routing(a['lat'],a['lon'],b['lat'],b['lon']);st.session_state.result51={'a':a,'b':b,'pa':pa,'pb':pb,'fa':fa,'fb':fb,'fla':fla,'flb':flb,'statuses':pa['status']+pb['status']+[fas,fbs,flas,flbs,rts],'route':rt,'weights':weights.copy(),'user':{'age':age,'house':house,'work':work,'cars':cars,'mobility':mobility,'schools':schools,'prop':prop,'budget':budget,'commute':commute,'must':must,'avoid':avoid}}
+r=st.session_state.result51
 if r:
- a,b,pa,pb,w,u=r['a'],r['b'],r['pa'],r['pb'],r['weights'],r['user'];va,vb=weighted(pa,w),weighted(pb,w);common=[k for k in THEMES if k in pa['available'] and k in pb['available']]
- st.success('Personalised briefing complete. Missing sources have not been converted into zeroes.')
- if va is None or vb is None:st.markdown('<div class=card><div class=verdict>Evidence incomplete</div><p>There is not enough comparable live evidence for a numerical verdict. The household-fit and source results remain useful.</p></div>',unsafe_allow_html=True)
+ va,vb=weighted(r['pa'],r['weights']),weighted(r['pb'],r['weights']);common=[k for k in THEMES if k in r['pa']['available'] and k in r['pb']['available']];st.success('Briefing complete. Missing sources are excluded, not shown as zero.')
+ if va is None:st.error('Insufficient comparable live evidence for a numerical verdict.')
  else:
-  d=vb-va;label='Strong candidate for further investigation' if d>=10 else 'Promising candidate' if d>=4 else 'Broadly comparable' if d>-4 else 'Current location remains stronger on selected evidence';st.markdown(f'<div class=card><div class=verdict>{label}</div><h2>Location consultant summary</h2><p>The destination scores <b>{vb:.0f}/100</b>, versus <b>{va:.0f}/100</b> for the current location, using only sources that returned comparable data.</p><p><b>Household context:</b> {html.escape(profile_text(u))}</p></div>',unsafe_allow_html=True)
- st.subheader('What the household profile changes');[st.write('• '+x) for x in fit_notes(u)]
- c1,c2,c3=st.columns(3);c1.metric('Current','N/A' if va is None else f'{va:.0f}/100');c2.metric('Destination','N/A' if vb is None else f'{vb:.0f}/100');c3.metric('Approx. drive','Unavailable' if not r['route'] else f'{r["route"][0]:.0f} mi · {r["route"][1]/60:.1f} hr')
- st.subheader('Additional live signals')
- x,y=st.columns(2)
- with x:
-  st.markdown('#### Food and eating-out footprint')
-  for name,data in [('Current',r['fa']),('Destination',r['fb'])]:st.write(f'**{name}:** unavailable' if not data else f"**{name}:** {data['count']} establishments returned; {data['high']} had numeric ratings of 4 or 5.")
- with y:
-  st.markdown('#### Real-time flood-monitoring context')
-  for name,data in [('Current',r['flooda']),('Destination',r['floodb'])]:st.write(f'**{name}:** unavailable' if not data else f"**{name}:** {data['active_warnings']} active warnings/alerts returned by the nearby query.")
-  st.caption('This is not property-level flood risk. Check the official long-term flood maps and conveyancing searches.')
- st.download_button('⬇ Download V5 consultant briefing',make_report(r),'movewise_v5_briefing.html','text/html',type='primary',use_container_width=True)
- with st.expander('Evidence scorecard, chart and map'):
-  if common:
-   df=pd.DataFrame({'Theme':common,'Current':[round(pa['scores'][k]) for k in common],'Destination':[round(pb['scores'][k]) for k in common]});st.dataframe(df,hide_index=True,use_container_width=True);fig=go.Figure();fig.add_bar(name='Current',x=common,y=[pa['scores'][k] for k in common]);fig.add_bar(name='Destination',x=common,y=[pb['scores'][k] for k in common]);fig.update_layout(barmode='group',yaxis_range=[0,100]);st.plotly_chart(fig,use_container_width=True)
-  m=folium.Map(location=[(a['lat']+b['lat'])/2,(a['lon']+b['lon'])/2],zoom_start=9);folium.Marker([a['lat'],a['lon']],tooltip='Current').add_to(m);folium.Marker([b['lat'],b['lon']],tooltip='Destination').add_to(m);st_folium(m,height=400,use_container_width=True)
- with st.expander('Source health and provenance',expanded=True):
-  for s in pa['status']+pb['status']+[r['route_status'],r['fa_status'],r['fb_status'],r['flooda_status'],r['floodb_status']]:st.markdown(status(s))
- st.subheader('Deeper research')
- c1,c2,c3,c4=st.columns(4);c1.link_button('Area360','https://area360.uk/',use_container_width=True);c2.link_button('AreaChecker','https://areachecker.co.uk/',use_container_width=True);c3.link_button('NestScope','https://www.nestscope.uk/',use_container_width=True);c4.link_button('Land Registry','https://landregistry.data.gov.uk/',use_container_width=True)
-st.caption('MoveWise UK v5 · Free public APIs can be incomplete or unavailable. Verify material decisions independently.')
+  d=vb-va;st.markdown(f'<div class=card><h2>{"Promising candidate" if d>=4 else "Broadly comparable" if d>-4 else "Current location scores more strongly"}</h2><p>Destination <b>{vb:.0f}/100</b>; current location <b>{va:.0f}/100</b>; difference <b>{d:+.0f}</b>.</p><p><b>Household:</b> {html.escape(age)}, {html.escape(house)}, {html.escape(work)}, {html.escape(prop)}, budget £{budget:,.0f}.</p></div>',unsafe_allow_html=True)
+ st.subheader('Household-fit prompts')
+ if work in ['Office/site-based','Hybrid']:st.write('• Test the actual peak-time commute to '+(commute or 'the regular destination')+'.')
+ if age in ['65–74','75+'] or mobility!='No particular requirement':st.write('• Check gradients, step-free transport, GP access and day-to-day walkability.')
+ if schools!='None':st.write('• Verify Ofsted, admissions, catchment and available places. Counts alone are insufficient.')
+ if cars=='No car':st.write('• Test food shopping, healthcare and evening journeys without a car.')
+ c1,c2,c3=st.columns(3);c1.metric('Current','N/A' if va is None else f'{va:.0f}/100');c2.metric('Destination','N/A' if vb is None else f'{vb:.0f}/100');c3.metric('Drive','Unavailable' if not r['route'] else f'{r["route"][0]:.0f} mi · {r["route"][1]/60:.1f} hr')
+ st.subheader('Additional live signals');x,y=st.columns(2);x.write('**Food Standards Agency**');x.write(f"Current: {r['fa']['count']} establishments; destination: {r['fb']['count']} establishments." if r['fa'] and r['fb'] else 'FSA data unavailable.');y.write('**Environment Agency live context**');y.write(f"Current: {r['fla']['count']} active alerts; destination: {r['flb']['count']} active alerts." if r['fla'] and r['flb'] else 'Flood-monitoring data unavailable.');y.caption('Not a property-level flood-risk search.')
+ if common:
+  df=pd.DataFrame({'Theme':common,'Current':[round(r['pa']['scores'][k]) for k in common],'Destination':[round(r['pb']['scores'][k]) for k in common]});st.dataframe(df,hide_index=True,use_container_width=True)
+ report=f"<!doctype html><meta charset=utf-8><h1>MoveWise UK v5.1</h1><h2>{html.escape(r['a']['label'])} to {html.escape(r['b']['label'])}</h2><p>Current: {'N/A' if va is None else f'{va:.0f}/100'}; destination: {'N/A' if vb is None else f'{vb:.0f}/100'}.</p><p>Household: {html.escape(str(r['user']))}</p><p>Missing sources were excluded, not scored as zero.</p>";st.download_button('Download briefing',report,'movewise_v5_1_briefing.html','text/html',use_container_width=True)
+ with st.expander('Source health',expanded=True):
+  for s in r['statuses']:st.markdown(('✅' if s['ok'] else '⚠️')+f" **{s['source']}**: {s['detail']}")
+st.caption('MoveWise UK v5.1 · Verify material property decisions independently.')
