@@ -1,6 +1,4 @@
-# MoveWise UK v2
-Upload the four files in this folder to a new GitHub repository, then deploy `streamlit_app.py` in Streamlit Community Cloud. No API keys are required.
+# MoveWise UK v3
+Upload the four files in this folder to the root of a GitHub repository and deploy `streamlit_app.py` in Streamlit Community Cloud. No API keys are required.
 
-V2 includes flexible UK location matching, selectable candidates, comparison, relocation adviser and shortlist modes, weighted priorities, fallback Overpass instances, graceful partial results, maps and downloadable HTML reports.
-
-Important: scores show mapped provision, not quality. Independently verify property-specific risks, schools, admissions, broadband, planning, transport and costs.
+V3 shows an executive summary directly below the action button, keeps results in Streamlit session state, explains gains and trade-offs in plain English, hides detailed evidence in an expander, and provides downloadable HTML or CSV output.
