@@ -1,4 +1,4 @@
-# MoveWise UK v4
-Upload the four files in this folder to the root of a GitHub repository and deploy `streamlit_app.py` in Streamlit Community Cloud. No API keys are required.
+# MoveWise UK v5
+Upload `streamlit_app.py`, `services.py`, `requirements.txt` and this README to the root of a GitHub repository and deploy `streamlit_app.py` in Streamlit Community Cloud.
 
-Key change: unavailable evidence is excluded rather than scored as zero. V4 provides a visible consultant-style verdict, personal context, gains, cautions, evidence status, map, downloadable HTML report and research links to Area360, HM Land Registry and data.gov.uk.
+V5 adds a detailed household profile, personalised fit notes, Food Standards Agency live hygiene-rating data, Environment Agency real-time flood-monitoring context, stronger provenance, research hand-offs, and preserves the rule that missing data is never scored as zero.
